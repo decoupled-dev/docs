@@ -264,3 +264,52 @@ adb shell "am broadcast -a com.poc.assistant.TEST_QUERY --es query 'what is the 
 A 1 Hz sampler that records CPU ticks, RSS, GPU utilisation/clock and CPU clocks for the PID is
 what produced §5; it is a 20-line `/system/bin/sh` loop over `/proc/$P/stat`, `/proc/$P/status`
 and the sysfs nodes above, pushed to `/data/local/tmp/` and run with `nohup`.
+
+
+
+8. DMS vision models (gesture + face)
+Static facts from the bundles in app/src/main/assets/ and the code in vision/dms/. Runtime CPU/GPU/latency for this pipeline was not measured; the app does not log per-frame inference time (only init). Input shapes below were read from the TFLite flatbuffers.
+
+8.1 Where it runs
+Item	Value
+Runtime	MediaPipe Tasks Vision 0.10.14 (libmediapipe_tasks_vision_jni.so, 14 MB)
+Delegate	Delegate.GPU first (Mali OpenCL via TFLite GPU delegate); falls back to Delegate.CPU (XNNPACK) if GPU init throws. Same process as the LLM, so both share the Mali-G710.
+Running mode	RunningMode.IMAGE (synchronous per frame, not the VIDEO/LIVE_STREAM tracker)
+Owner	DriverMoodCaptureService (foreground service) → DmsCameraManager (CameraX, front camera, STRATEGY_KEEP_ONLY_LATEST) → DriverMonitoringManager.processFrame()
+Frame rate	Throttled to one AI pass per 100 ms (≤ 10 fps) in both FULL and LITE profiles (DmsCaptureProfile)
+Analysis resolution	FULL: camera default; LITE: 480×360
+Per-frame work	DriverFaceProcessor (if mood enabled) → HandGestureProcessor (if gestures enabled) → HealthRppgProcessor (CPU, if rPPG enabled), on a single coroutine
+Enabled by	SET_DMS_PIPELINE broadcast / app_prefs (gestures, mood), camera sensor privacy gate (DmsCameraSensorGate)
+Not running by default	Camera and both models are only loaded while the capture service is up; released when the sensor is turned off
+8.2 Gesture model: gesture_recognizer.task (8.0 MB on disk)
+A MediaPipe bundle of four TFLite models chained inside the task runtime:
+
+Stage	File	Size	Input	Output
+1. Palm detection	hand_detector.tflite	2.34 MB	[1,192,192,3] f32	palm boxes (SSD anchors)
+2. Hand landmarks	hand_landmarks_detector.tflite	5.48 MB	[1,224,224,3] f32 (crop)	21 landmarks ×3 + handedness + presence
+3. Gesture embedder	gesture_embedder.tflite	0.55 MB	hand[1,21,3], world_hand[1,21,3], handedness[1,1]	128-d embedding
+4. Canned classifier	canned_gesture_classifier.tflite	8 KB	[1,128] f32	8 classes
+Classes (from the bundled labels.txt): None, Closed_Fist, Open_Palm, Pointing_Up, Thumb_Down, Thumb_Up, Victory, ILoveYou. Stages 1–2 are image CNNs and are what the GPU delegate accelerates; 3–4 are tiny MLPs over landmarks. Stage 1 only re-runs when no hand is tracked from the previous frame.
+
+App-side post-processing (HandGestureProcessor, DmsVictorySignPolicy, DmsMediaGestureArbiter):
+
+Setting (dms_gesture_config.json)	Value
+minConfidenceScore	0.45
+debounceMs	800
+Mappings	Pointing_Up→wake, Thumb_Up/Thumb_Down→volume, Open_Palm→pause, Victory→play, ILoveYou→favorite, Closed_Fist→none
+Synthetic gestures from landmark trajectory (not from the model)	Swipe_Left/Swipe_Right → prev/next track, Pinch → mute, Two_Fingers_* → prev/next
+8.3 Face model: face_landmarker.task (3.6 MB on disk)
+Stage	File	Size	Input	Output
+1. Face detection (BlazeFace short-range)	face_detector.tflite	0.23 MB	[1,128,128,3] f32	face boxes
+2. Face mesh	face_landmarks_detector.tflite	2.55 MB	[1,256,256,3] f32 (crop)	478 landmarks
+3. Blendshapes	face_blendshapes.tflite	0.96 MB	[1,146,2] f32 (landmark subset)	52 blendshape scores
+setNumFaces(2) (driver + passenger), so stages 2–3 run up to twice per frame. The app reads blendshapes (eyeBlink*, browDown*, mouthFrown*, …) for drowsiness, distraction/gaze and emotion (thresholds in dms_gesture_config.json), and the cheek landmark feeds rPPG.
+
+8.4 Memory
+Component	Size	Basis
+Gesture model weights (4 files)	8.0 MB	on disk, loaded via AssetManager mmap
+Face model weights (3 files)	3.6 MB	on disk
+Input tensors per frame (f32)	0.44 MB (192²) + 0.60 MB (224²) for hands; 0.20 MB (128²) + 0.79 MB (256²) per face	shape × 4 bytes
+Analysis frame (LITE 480×360 RGBA bitmap + MPImage copy)	~0.7 MB × 2	resolution × 4 bytes
+Runtime working set (GPU delegate programs/buffers + activations + MediaPipe graph)	not measured; typically tens of MB for this pair of task bundles	—
+For comparison, the LLM holds ~1.9 GB of GPU memory, so the DMS models are < 1 % of the app's footprint. The visible cost of DMS is CPU/GPU time at up to 10 fps and the camera HAL buffers, not memory. Measure it with the same sampler as §5 while toggling SET_DMS_PIPELINE once a device is attached.
