@@ -1,8 +1,17 @@
 # Runtime Metrics Snapshot
 
-Measured on the demo device on **2026-10-21 14:25–14:34 JST**, release build of `demo_30thaug`
-(commit `e550d82d`, APK SHA-256 `e805e94f…38c8e`, installed 14:24:52). All numbers come from
-`adb` (root) against the live app process; nothing here is estimated from code unless marked.
+Measured on the demo device on **2026-10-21** in two captures, both over `adb` (root) against the
+live app process. Nothing here is estimated from code unless marked.
+
+| Capture | Time (JST) | Build on device | APK SHA-256 |
+|---|---|---|---|
+| A (load test, §4.2 / §5) | 14:25–14:34 | `e550d82d` (hybrid cascade commit) | `e805e94f…38c8e` |
+| B (re-verification) | 15:06–15:30 | **`55067332`** (feat(config): set default wake word to hey iris, 2026-09-30) = current `demo_30thaug` | `8642bff0…` |
+
+The two builds differ only by the hybrid-cascade router and `hybrid_route_policy.json`; model file,
+engine config (`forcedBackendChoice = "GPU"`, `maxNumTokens = 4096`, speculative decoding on),
+tool registry (130 tools, 9 readable properties) and system prompt (1 306 tokens) are identical,
+and every static number below was re-checked against build B.
 
 Reproduction commands are at the end. Re-run this snapshot after any change to the model file,
 `LLMManager`, the system prompt, or the tool registry.
@@ -18,8 +27,8 @@ Reproduction commands are at the end. Re-run this snapshot after any change to t
 | CPU | 8 cores: 4× Cortex-A55 @ 1.80 GHz, 2× Cortex-A78 @ 2.35 GHz, 2× Cortex-X1 @ 2.85 GHz |
 | GPU | Arm Mali-G710 (`mali0`), DVFS 202–848 MHz |
 | RAM | 7.6 GB total (`MemTotal` 7 600 328 kB); ~1.4 GB available with the app resident |
-| Power at capture | USB powered, battery 9 %, charging at ~0.88 A |
-| Thermal at capture | BIG cluster 81 °C, MID 69 °C, LITTLE 71 °C, GPU 49 °C, skin 39 °C (skin status 1 = light throttling) |
+| Power at capture | A: USB powered, battery 9 %, charging at ~0.88 A. B: battery 14 %, USB, ~0.58 A |
+| Thermal at capture | A: BIG cluster 81 °C, MID 69 °C, LITTLE 71 °C, GPU 49 °C, skin 39 °C (skin status 1 = light throttling). B (idle): BIG 53 °C, GPU 49 °C, TPU 49 °C, skin 38 °C |
 
 > Battery was at 9 % during capture. Keep the tablet above ~30 % when benchmarking; the kernel
 > throttles aggressively at low charge and TTFT will drift upward.
@@ -53,7 +62,19 @@ Reproduction commands are at the end. Re-run this snapshot after any change to t
 | Engine instance | One `Engine` + one `Conversation` for the process, serialised by `inferenceMutex`; session reset = `resetConversation()`, never re-init |
 | Prewarm | After init, the system prompt + `"Input: Hello / Output: Hello! …"` is pushed through the model so the KV cache already holds the system prompt |
 
-### 2.3 Cold-start timeline (from logcat, this boot)
+### 2.3 Which accelerator each model uses (verified on device, capture B)
+
+| Model | Requested in code | Actually running on | Evidence |
+|---|---|---|---|
+| Gemma 4 E2B (LiteRT-LM) | `Backend.GPU()` (hard-coded; the `Backend.NPU()` branch is unreachable) | **Mali-G710 GPU** via OpenCL | GPU clock pins at 848 MHz / 100 % during generation (§5.3); ML Drift weight cache on disk |
+| Gesture + face (MediaPipe) | `Delegate.GPU`, CPU fallback | **GPU** (when the camera is on) | `vkp-mediapipe` thread present after a camera session; delegate init lines rotated out of the log buffer |
+| YAMNet audio events | `useNnapi()` | **Edge TPU** via NNAPI → `android.hardware.neuralnetworks.IDevice/google-edgetpu` (DarwiNN driver), unsupported ops fall back to CPU | App process holds binder nodes inside the DarwiNN service (`/dev/binderfs/binder_logs/proc/<darwinn pid>` lists `proc <app pid>`); the service holds an `edgetpu-soc` client with a wakelock; `libneuralnetworks.so` is mapped in the app |
+| USE / BGE embeddings, Vosk | TFLite CPU / native | **CPU** (XNNPACK: "Replacing 44 out of 46 node(s) with TfLiteXNNPackDelegate") | logcat `tflite` lines |
+
+So the Tensor TPU is used, but only by the small audio classifier; the LLM and the vision models
+never touch it.
+
+### 2.4 Cold-start timeline (from logcat, capture A)
 
 | Phase | Start → End | Duration |
 |---|---|---|
@@ -64,7 +85,7 @@ Reproduction commands are at the end. Re-run this snapshot after any change to t
 GPU program/weight caches were regenerated at 14:12 (fresh install). First-ever init after a cache
 wipe takes longer than the 5.2 s above.
 
-### 2.4 GPU-side cache files (`/data/user/10/com.poc.assistant/no_backup/litert_gpu_cache/`)
+### 2.5 GPU-side cache files (`/data/user/10/com.poc.assistant/no_backup/litert_gpu_cache/`)
 
 | File | Size | Status |
 |---|---|---|
@@ -76,7 +97,7 @@ wipe takes longer than the 5.2 s above.
 
 **≈ 3.1 GB of stale cache is reclaimable** (`app data` dir is 3.7 GB; the live caches need ~0.85 GB).
 
-### 2.5 Other ML models bundled in the APK
+### 2.6 Other ML models bundled in the APK
 
 | Model | Use | Size |
 |---|---|---|
@@ -119,6 +140,11 @@ APK: `app-release.apk` 291 MB; installed code path 279 MB.
 
 One cloud-routed turn (hybrid cascade, `Route=Cloud`): TTFT 1 267 ms, 82.9 tok/s, total 1 472 ms.
 
+Capture B (build `55067332`, 4 voice turns, battery 14 %, cooler device): TTFT 548 / 1 294 (median) /
+2 437 ms (min / median / max), 18–36 tok/s (mean 27), total generation median 2.9 s, Ctx 1 418–1 823.
+The 548 ms turn is the only observed turn under the 600 ms budget. On this build the
+`UiPerfMetrics` line has no `Route=` field.
+
 ### 4.2 Injected test queries (`LocalLLMActivity` → `TEST_QUERY`), measured with the sampler running
 
 | # | Query | Prompt Δ (tok) | Ctx | TTFT (ms) | tok/s | Gen total (ms) | Tool time |
@@ -148,17 +174,18 @@ Observations:
 
 | Category | PSS | Notes |
 |---|---|---|
-| **Total PSS** | **2.74 GB** (2 741 880 kB) | ≈ 36–38 % of device RAM |
-| Graphics (`GL mtrack`) | 1.88 GB | GPU buffers: transformer weights + KV cache + activations |
-| Native heap | 541 MB (762 MB reserved) | LiteRT-LM host-side allocations, Vosk, TFLite |
-| Other mmap | 244 MB | model file / cache mmaps |
-| Code (.so/.dex/.oat/.apk) | 43 MB PSS (153 MB RSS) | |
-| Java heap | 14.7 MB (19 MB reserved) | |
-| Stack | 1.3 MB | 48 threads |
-| Swap | 21 MB | |
-| `VmHWM` (peak RSS this process lifetime) | 3.09 GB | |
+| **Total PSS** | **2.74–2.75 GB** (A: 2 741 880 kB, B: 2 748 276 kB) | ≈ 35–38 % of device RAM |
+| Graphics (`GL mtrack`) | 1.86–1.88 GB | GPU buffers: transformer weights + KV cache + activations |
+| Native heap | 371–541 MB (762–895 MB reserved) | LiteRT-LM host-side allocations, Vosk, TFLite |
+| Other mmap | 162–244 MB | model file / cache mmaps |
+| Code (.so/.dex/.oat/.apk) | 43–55 MB PSS (153–166 MB RSS) | |
+| Java heap | 14 MB (19–23 MB reserved) | |
+| Stack | 1.3–2.2 MB | 48 threads (A) → 118 threads (B, after a camera/DMS session and OCR init: CameraX, `vkp-mediapipe`, `ocr_*`, 45 anonymous `Thread-N`) |
+| Swap | A: 21 MB (`VmSwap`), swap PSS 0.3 MB. **B: 278 MB `VmSwap`, swap PSS 256 MB** | After 20 min uptime with 1.4 GB free, the kernel starts paging the native heap out |
+| `VmHWM` (peak RSS this process lifetime) | 2.90–3.09 GB | |
 
-GPU memory owned by the process (`dumpsys gpu`): **1.914 GB** of 2.643 GB global GPU allocation.
+GPU memory owned by the process (`dumpsys gpu`): **1.90–1.91 GB** (A: 1.914 GB of 2.643 GB global,
+B: 1.904 GB of 2.883 GB global).
 
 Under inference RSS rose only from 2 678 MB → 2 768 MB (+90 MB); the working set is essentially
 static once the model is loaded.
@@ -169,7 +196,7 @@ Measured as scheduler ticks/s for the PID (100 Hz, so 100 = one full core), 1 s 
 
 | State | App CPU | Which threads |
 |---|---|---|
-| Idle, model loaded, wake-word listening | **25–35 %** of one core (`top`: 21–28 %) | `DefaultDispatcher` worker (Vosk decode loop) 16.5 %, main thread 4.3 %, RenderThread 0.5 % |
+| Idle, model loaded, wake-word listening | **22–35 %** of one core (`top`: 21–30 % in both captures) | `DefaultDispatcher` worker (Vosk decode + YAMNet) 10–16.5 %, main thread 4–7 %, RenderThread 0.5–3 % |
 | During prefill + decode | **50–100 %** of one core (peaks 83, 80, 102 ticks/s) | LiteRT GPU driver thread + tokenizer/callback thread |
 | System-wide idle | 800 % cpu capacity, ~660–690 % idle | |
 
@@ -180,7 +207,7 @@ the per-token callback chain. The always-on ~0.3 core is wake-word listening, no
 
 | State | Mali utilisation (`/sys/class/misc/mali0/device/utilization`) | GPU clock |
 |---|---|---|
-| Idle (launcher + overlay compositing) | noisy 0–80 % (system-wide counter; SurfaceFlinger/launcher dominate) | 302–471 MHz |
+| Idle (launcher + overlay compositing) | noisy 0–80 % (system-wide counter; SurfaceFlinger/launcher dominate); 12 % with screen static | 202–471 MHz |
 | During prefill + decode | **99–100 %** sustained for the whole generation | **848 MHz (max)** pinned |
 | Between generations | drops back within 1 s | returns to 351–471 MHz |
 
@@ -226,7 +253,82 @@ little cores stay at 1.2–1.8 GHz. The LLM is GPU-bound; CPU DVFS is driven by 
 
 ---
 
-## 8. How this was measured (reproduce)
+## 8. DMS vision models (gesture + face)
+
+Static facts from the bundles in `app/src/main/assets/` and the code in `vision/dms/`. Runtime
+CPU/GPU/latency for this pipeline was **not** measured; the app does not log per-frame inference
+time (only init). Input shapes below were read from the TFLite flatbuffers.
+
+### 8.1 Where it runs
+
+| Item | Value |
+|---|---|
+| Runtime | MediaPipe Tasks Vision `0.10.14` (`libmediapipe_tasks_vision_jni.so`, 14 MB) |
+| Delegate | `Delegate.GPU` first (Mali OpenCL via TFLite GPU delegate); falls back to `Delegate.CPU` (XNNPACK) if GPU init throws. Same process as the LLM, so both share the Mali-G710. |
+| Running mode | `RunningMode.IMAGE` (synchronous per frame, not the VIDEO/LIVE_STREAM tracker) |
+| Owner | `DriverMoodCaptureService` (foreground service) → `DmsCameraManager` (CameraX, front camera, `STRATEGY_KEEP_ONLY_LATEST`) → `DriverMonitoringManager.processFrame()` |
+| Frame rate | Throttled to one AI pass per **100 ms (≤ 10 fps)** in both FULL and LITE profiles (`DmsCaptureProfile`) |
+| Analysis resolution | FULL: camera default; LITE: **480×360** |
+| Per-frame work | `DriverFaceProcessor` (if mood enabled) → `HandGestureProcessor` (if gestures enabled) → `HealthRppgProcessor` (CPU, if rPPG enabled), on a single coroutine |
+| Enabled by | `SET_DMS_PIPELINE` broadcast / `app_prefs` (`gestures`, `mood`), camera sensor privacy gate (`DmsCameraSensorGate`) |
+| Not running by default | Camera and both models are only loaded while the capture service is up; released when the sensor is turned off |
+| Observed on device (capture B) | Front camera opened 15:17:03, killed 15:17:51 by the SystemUI camera-sensor privacy toggle (`ERROR_CAMERA_DISABLED` → `DmsCameraSensorGate allowed=false` → "Released DMS MediaPipe processors"). A `vkp-mediapipe` thread and two `CameraX-core` threads remained in the process afterwards |
+
+### 8.2 Gesture model: `gesture_recognizer.task` (8.0 MB on disk)
+
+A MediaPipe bundle of four TFLite models chained inside the task runtime:
+
+| Stage | File | Size | Input | Output |
+|---|---|---|---|---|
+| 1. Palm detection | `hand_detector.tflite` | 2.34 MB | `[1,192,192,3]` f32 | palm boxes (SSD anchors) |
+| 2. Hand landmarks | `hand_landmarks_detector.tflite` | 5.48 MB | `[1,224,224,3]` f32 (crop) | 21 landmarks ×3 + handedness + presence |
+| 3. Gesture embedder | `gesture_embedder.tflite` | 0.55 MB | `hand[1,21,3]`, `world_hand[1,21,3]`, `handedness[1,1]` | 128-d embedding |
+| 4. Canned classifier | `canned_gesture_classifier.tflite` | 8 KB | `[1,128]` f32 | 8 classes |
+
+Classes (from the bundled `labels.txt`): `None`, `Closed_Fist`, `Open_Palm`, `Pointing_Up`,
+`Thumb_Down`, `Thumb_Up`, `Victory`, `ILoveYou`. Stages 1–2 are image CNNs and are what the GPU
+delegate accelerates; 3–4 are tiny MLPs over landmarks. Stage 1 only re-runs when no hand is
+tracked from the previous frame.
+
+App-side post-processing (`HandGestureProcessor`, `DmsVictorySignPolicy`, `DmsMediaGestureArbiter`):
+
+| Setting (`dms_gesture_config.json`) | Value |
+|---|---|
+| `minConfidenceScore` | 0.45 |
+| `debounceMs` | 800 |
+| Mappings | `Pointing_Up`→wake, `Thumb_Up`/`Thumb_Down`→volume, `Open_Palm`→pause, `Victory`→play, `ILoveYou`→favorite, `Closed_Fist`→none |
+| Synthetic gestures from landmark trajectory (not from the model) | `Swipe_Left`/`Swipe_Right` → prev/next track, `Pinch` → mute, `Two_Fingers_*` → prev/next |
+
+### 8.3 Face model: `face_landmarker.task` (3.6 MB on disk)
+
+| Stage | File | Size | Input | Output |
+|---|---|---|---|---|
+| 1. Face detection (BlazeFace short-range) | `face_detector.tflite` | 0.23 MB | `[1,128,128,3]` f32 | face boxes |
+| 2. Face mesh | `face_landmarks_detector.tflite` | 2.55 MB | `[1,256,256,3]` f32 (crop) | 478 landmarks |
+| 3. Blendshapes | `face_blendshapes.tflite` | 0.96 MB | `[1,146,2]` f32 (landmark subset) | 52 blendshape scores |
+
+`setNumFaces(2)` (driver + passenger), so stages 2–3 run up to twice per frame. The app reads
+blendshapes (`eyeBlink*`, `browDown*`, `mouthFrown*`, …) for drowsiness, distraction/gaze and
+emotion (thresholds in `dms_gesture_config.json`), and the cheek landmark feeds rPPG.
+
+### 8.4 Memory
+
+| Component | Size | Basis |
+|---|---|---|
+| Gesture model weights (4 files) | **8.0 MB** | on disk, loaded via AssetManager mmap |
+| Face model weights (3 files) | **3.6 MB** | on disk |
+| Input tensors per frame (f32) | 0.44 MB (192²) + 0.60 MB (224²) for hands; 0.20 MB (128²) + 0.79 MB (256²) per face | shape × 4 bytes |
+| Analysis frame (LITE 480×360 RGBA bitmap + `MPImage` copy) | ~0.7 MB × 2 | resolution × 4 bytes |
+| Runtime working set (GPU delegate programs/buffers + activations + MediaPipe graph) | **not measured**; typically tens of MB for this pair of task bundles | — |
+
+For comparison, the LLM holds ~1.9 GB of GPU memory, so the DMS models are < 1 % of the app's
+footprint. The visible cost of DMS is CPU/GPU time at up to 10 fps and the camera HAL buffers,
+not memory. Measure it with the same sampler as §5 while toggling `SET_DMS_PIPELINE` once a device
+is attached.
+
+---
+
+## 9. How this was measured (reproduce)
 
 ```bash
 adb root
@@ -248,6 +350,13 @@ adb shell cat /sys/class/misc/mali0/device/utilization /sys/class/misc/mali0/dev
 adb shell "dumpsys thermalservice | grep Temperature"
 adb shell "dumpsys battery | grep -E 'level|powered'"
 
+# Edge TPU / NNAPI: which process is using the TPU
+adb shell "service list | grep neuralnetworks"                       # google-edgetpu IDevice instance
+adb shell "ps -A | grep darwinn"                                      # NNAPI driver pid
+adb shell "cat /sys/class/edgetpu/edgetpu-soc/device/clients"         # tgid holding the TPU + wakelock
+adb shell "cat /dev/binderfs/binder_logs/proc/<darwinn pid> | grep 'proc $P'"  # app is a client if lines appear
+adb shell "grep -iE 'neuralnetworks|darwinn' /proc/$P/maps | awk '{print \$6}' | sort -u"
+
 # Model + caches
 adb shell ls -la /data/media/10/Android/data/com.poc.assistant/files/
 adb shell ls -la /data/user/10/com.poc.assistant/no_backup/litert_gpu_cache/
@@ -264,52 +373,3 @@ adb shell "am broadcast -a com.poc.assistant.TEST_QUERY --es query 'what is the 
 A 1 Hz sampler that records CPU ticks, RSS, GPU utilisation/clock and CPU clocks for the PID is
 what produced §5; it is a 20-line `/system/bin/sh` loop over `/proc/$P/stat`, `/proc/$P/status`
 and the sysfs nodes above, pushed to `/data/local/tmp/` and run with `nohup`.
-
-
-
-8. DMS vision models (gesture + face)
-Static facts from the bundles in app/src/main/assets/ and the code in vision/dms/. Runtime CPU/GPU/latency for this pipeline was not measured; the app does not log per-frame inference time (only init). Input shapes below were read from the TFLite flatbuffers.
-
-8.1 Where it runs
-Item	Value
-Runtime	MediaPipe Tasks Vision 0.10.14 (libmediapipe_tasks_vision_jni.so, 14 MB)
-Delegate	Delegate.GPU first (Mali OpenCL via TFLite GPU delegate); falls back to Delegate.CPU (XNNPACK) if GPU init throws. Same process as the LLM, so both share the Mali-G710.
-Running mode	RunningMode.IMAGE (synchronous per frame, not the VIDEO/LIVE_STREAM tracker)
-Owner	DriverMoodCaptureService (foreground service) → DmsCameraManager (CameraX, front camera, STRATEGY_KEEP_ONLY_LATEST) → DriverMonitoringManager.processFrame()
-Frame rate	Throttled to one AI pass per 100 ms (≤ 10 fps) in both FULL and LITE profiles (DmsCaptureProfile)
-Analysis resolution	FULL: camera default; LITE: 480×360
-Per-frame work	DriverFaceProcessor (if mood enabled) → HandGestureProcessor (if gestures enabled) → HealthRppgProcessor (CPU, if rPPG enabled), on a single coroutine
-Enabled by	SET_DMS_PIPELINE broadcast / app_prefs (gestures, mood), camera sensor privacy gate (DmsCameraSensorGate)
-Not running by default	Camera and both models are only loaded while the capture service is up; released when the sensor is turned off
-8.2 Gesture model: gesture_recognizer.task (8.0 MB on disk)
-A MediaPipe bundle of four TFLite models chained inside the task runtime:
-
-Stage	File	Size	Input	Output
-1. Palm detection	hand_detector.tflite	2.34 MB	[1,192,192,3] f32	palm boxes (SSD anchors)
-2. Hand landmarks	hand_landmarks_detector.tflite	5.48 MB	[1,224,224,3] f32 (crop)	21 landmarks ×3 + handedness + presence
-3. Gesture embedder	gesture_embedder.tflite	0.55 MB	hand[1,21,3], world_hand[1,21,3], handedness[1,1]	128-d embedding
-4. Canned classifier	canned_gesture_classifier.tflite	8 KB	[1,128] f32	8 classes
-Classes (from the bundled labels.txt): None, Closed_Fist, Open_Palm, Pointing_Up, Thumb_Down, Thumb_Up, Victory, ILoveYou. Stages 1–2 are image CNNs and are what the GPU delegate accelerates; 3–4 are tiny MLPs over landmarks. Stage 1 only re-runs when no hand is tracked from the previous frame.
-
-App-side post-processing (HandGestureProcessor, DmsVictorySignPolicy, DmsMediaGestureArbiter):
-
-Setting (dms_gesture_config.json)	Value
-minConfidenceScore	0.45
-debounceMs	800
-Mappings	Pointing_Up→wake, Thumb_Up/Thumb_Down→volume, Open_Palm→pause, Victory→play, ILoveYou→favorite, Closed_Fist→none
-Synthetic gestures from landmark trajectory (not from the model)	Swipe_Left/Swipe_Right → prev/next track, Pinch → mute, Two_Fingers_* → prev/next
-8.3 Face model: face_landmarker.task (3.6 MB on disk)
-Stage	File	Size	Input	Output
-1. Face detection (BlazeFace short-range)	face_detector.tflite	0.23 MB	[1,128,128,3] f32	face boxes
-2. Face mesh	face_landmarks_detector.tflite	2.55 MB	[1,256,256,3] f32 (crop)	478 landmarks
-3. Blendshapes	face_blendshapes.tflite	0.96 MB	[1,146,2] f32 (landmark subset)	52 blendshape scores
-setNumFaces(2) (driver + passenger), so stages 2–3 run up to twice per frame. The app reads blendshapes (eyeBlink*, browDown*, mouthFrown*, …) for drowsiness, distraction/gaze and emotion (thresholds in dms_gesture_config.json), and the cheek landmark feeds rPPG.
-
-8.4 Memory
-Component	Size	Basis
-Gesture model weights (4 files)	8.0 MB	on disk, loaded via AssetManager mmap
-Face model weights (3 files)	3.6 MB	on disk
-Input tensors per frame (f32)	0.44 MB (192²) + 0.60 MB (224²) for hands; 0.20 MB (128²) + 0.79 MB (256²) per face	shape × 4 bytes
-Analysis frame (LITE 480×360 RGBA bitmap + MPImage copy)	~0.7 MB × 2	resolution × 4 bytes
-Runtime working set (GPU delegate programs/buffers + activations + MediaPipe graph)	not measured; typically tens of MB for this pair of task bundles	—
-For comparison, the LLM holds ~1.9 GB of GPU memory, so the DMS models are < 1 % of the app's footprint. The visible cost of DMS is CPU/GPU time at up to 10 fps and the camera HAL buffers, not memory. Measure it with the same sampler as §5 while toggling SET_DMS_PIPELINE once a device is attached.
